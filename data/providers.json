@@ -1,0 +1,40 @@
+{
+  "providers": [
+    {
+      "name": "Smile Dental",
+      "service": "dentist",
+      "phone": "+15550101",
+      "availability": ["2026-02-08 14:00", "2026-02-08 16:00"],
+      "rating": 4.6,
+      "distance_miles": 2.3,
+      "simulated_latency_s": 1.5
+    },
+    {
+      "name": "Bright Teeth",
+      "service": "dentist",
+      "phone": "+15550102",
+      "availability": ["2026-02-08 15:30"],
+      "rating": 4.8,
+      "distance_miles": 3.1,
+      "simulated_latency_s": 2.2
+    },
+    {
+      "name": "Family Dental",
+      "service": "dentist",
+      "phone": "+15550103",
+      "availability": ["2026-02-08 13:00"],
+      "rating": 4.2,
+      "distance_miles": 1.2,
+      "simulated_latency_s": 1.8
+    },
+    {
+      "name": "AutoFix Garage",
+      "service": "auto_repair",
+      "phone": "+15550201",
+      "availability": ["2026-02-08 11:00", "2026-02-08 15:00"],
+      "rating": 4.4,
+      "distance_miles": 4.5,
+      "simulated_latency_s": 1.6
+    }
+  ]
+}
