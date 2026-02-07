@@ -1,0 +1,13 @@
+{
+  "user_calendar": {
+    "busy_slots": [
+      { "start": "2026-02-08 09:00", "end": "2026-02-08 10:00", "title": "Team Standup" },
+      { "start": "2026-02-08 12:00", "end": "2026-02-08 13:00", "title": "Lunch" },
+      { "start": "2026-02-08 15:00", "end": "2026-02-08 16:00", "title": "Client Meeting" }
+    ],
+    "preferences": {
+      "day_start": "08:00",
+      "day_end": "18:00"
+    }
+  }
+}

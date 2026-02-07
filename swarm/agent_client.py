@@ -1,8 +1,41 @@
 import asyncio
+import json
 import os
 from datetime import datetime
+from pathlib import Path
 
 import requests
+
+APP_ROOT = Path(__file__).resolve().parent.parent
+CALENDAR_PATH = APP_ROOT / "data" / "calendar.json"
+
+
+def _load_busy_slots():
+    try:
+        if not CALENDAR_PATH.exists():
+            return []
+        with open(CALENDAR_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            # Normalize to datetime objects for comparison
+            # Assuming format: "2026-02-08 09:00"
+            busy = []
+            for item in data.get("user_calendar", {}).get("busy_slots", []):
+                start = datetime.fromisoformat(item["start"])
+                end = datetime.fromisoformat(item["end"])
+                busy.append((start, end))
+            return busy
+    except Exception:
+        return []
+
+
+def _is_busy(slot_dt, busy_slots, duration_minutes=60):
+    # Simple check: if slot start matches any busy start or falls within
+    # Ideally we'd check slot_dt + duration vs busy range
+    # Hackathon simplified: just check if slot_dt is inside a busy range
+    for start, end in busy_slots:
+        if start <= slot_dt < end:
+            return True
+    return False
 
 
 def _parse_slot(slot_str, date_hint=None):
@@ -16,7 +49,7 @@ def _parse_slot(slot_str, date_hint=None):
         return None
 
 
-def _pick_slot(availability, time_window):
+def _pick_slot(availability, time_window, busy_slots=None):
     if not availability:
         return None
     date_hint = None
@@ -26,6 +59,14 @@ def _pick_slot(availability, time_window):
     parsed = [(slot, dt) for slot, dt in parsed if dt]
     if not parsed:
         return None
+    
+    # Filter out busy slots
+    if busy_slots:
+        parsed = [(slot, dt) for slot, dt in parsed if not _is_busy(dt, busy_slots)]
+    
+    if not parsed:
+        return None
+
     if not time_window:
         return sorted(parsed, key=lambda item: item[1])[0][0]
 
@@ -44,7 +85,11 @@ async def _mock_call(provider, payload):
     await asyncio.sleep(provider.get("simulated_latency_s", 1.5))
     time_window = payload.get("time_window")
     availability = provider.get("availability", [])
-    slot = _pick_slot(availability, time_window)
+    
+    # Load busy slots for conflict checking
+    busy_slots = _load_busy_slots()
+    
+    slot = _pick_slot(availability, time_window, busy_slots)
     if not slot:
         return {
             "status": "no_availability",

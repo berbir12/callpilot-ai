@@ -1,10 +1,11 @@
 import json
 import os
+import asyncio
 from pathlib import Path
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, Response, stream_with_context
 
-from swarm.orchestrator import run_swarm_sync
+from swarm.orchestrator import run_swarm_sync, run_swarm_stream
 
 APP_ROOT = Path(__file__).resolve().parent
 PROVIDERS_PATH = APP_ROOT / "data" / "providers.json"
@@ -43,6 +44,35 @@ def swarm():
 
     result = run_swarm_sync(payload, providers)
     return jsonify(result)
+
+
+@app.post("/swarm/stream")
+def swarm_stream():
+    payload = request.get_json(silent=True) or {}
+    service = payload.get("service")
+    limit = payload.get("limit")
+    providers = filter_providers(load_providers(), service, limit)
+    if not providers:
+        return jsonify({"error": "no providers available"}), 400
+
+    def generate():
+        # Bridge async generator to sync generator for Flask
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        gen = run_swarm_stream(payload, providers)
+        
+        try:
+            while True:
+                try:
+                    item = loop.run_until_complete(gen.__anext__())
+                    yield json.dumps(item) + "\n"
+                except StopAsyncIteration:
+                    break
+        finally:
+            loop.close()
+
+    return Response(stream_with_context(generate()), mimetype="application/x-ndjson")
 
 
 if __name__ == "__main__":
