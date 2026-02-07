@@ -1,4 +1,6 @@
 import asyncio
+import queue
+import threading
 
 from swarm.agent_client import call_provider
 from swarm.scoring import score_candidate
@@ -13,7 +15,7 @@ async def run_swarm(payload, providers, max_concurrency=5, timeout_s=25):
             try:
                 # Simulate "parallel" starts with small random jitter if mocking
                 # This helps the visual dashboard look more organic
-                await asyncio.sleep(0.1) 
+                await asyncio.sleep(0.1)
                 return await asyncio.wait_for(
                     call_provider(provider, payload), timeout=timeout_s
                 )
@@ -62,7 +64,7 @@ async def run_swarm_stream(payload, providers, max_concurrency=5, timeout_s=25):
     async def run_one(provider):
         async with semaphore:
             try:
-                 # Small jitter for visual effect
+                # Small jitter for visual effect
                 await asyncio.sleep(0.1)
                 return await asyncio.wait_for(
                     call_provider(provider, payload), timeout=timeout_s
@@ -87,9 +89,13 @@ async def run_swarm_stream(payload, providers, max_concurrency=5, timeout_s=25):
         # Or just show the raw result. Let's send the raw result + score if ok.
         scored_result = result
         if result.get("status") == "ok":
-             scored = score_candidate(result, payload)
-             scored_result = {**result, "score": scored["score"], "components": scored["components"]}
-        
+            scored = score_candidate(result, payload)
+            scored_result = {
+                **result,
+                "score": scored["score"],
+                "components": scored["components"],
+            }
+
         yield {"type": "progress", "result": scored_result}
 
     # Final ranking
@@ -109,3 +115,25 @@ async def run_swarm_stream(payload, providers, max_concurrency=5, timeout_s=25):
 
 def run_swarm_sync(payload, providers, max_concurrency=5, timeout_s=25):
     return asyncio.run(run_swarm(payload, providers, max_concurrency, timeout_s))
+
+
+def stream_swarm_sync(payload, providers, max_concurrency=5, timeout_s=25):
+    updates = queue.Queue()
+
+    async def producer():
+        async for event in run_swarm_stream(
+            payload, providers, max_concurrency, timeout_s
+        ):
+            updates.put(event)
+        updates.put(None)
+
+    def runner():
+        asyncio.run(producer())
+
+    threading.Thread(target=runner, daemon=True).start()
+
+    while True:
+        event = updates.get()
+        if event is None:
+            break
+        yield event

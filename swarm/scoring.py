@@ -40,8 +40,8 @@ def score_candidate(result, payload):
     provider = result.get("provider", {})
     preferences = payload.get("preferences", {})
     weights = {
-        "time": preferences.get("time_weight", 0.5),
-        "rating": preferences.get("rating_weight", 0.3),
+        "time": preferences.get("time_weight", 0.6),
+        "rating": preferences.get("rating_weight", 0.2),
         "distance": preferences.get("distance_weight", 0.2),
     }
     total_weight = sum(weights.values()) or 1.0

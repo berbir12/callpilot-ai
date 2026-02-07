@@ -1,0 +1,9 @@
+﻿{
+    "time_window":  {
+                        "date":  "2026-02-08",
+                        "end":  "17:00",
+                        "start":  "13:00"
+                    },
+    "limit":  3,
+    "service":  "dentist"
+}

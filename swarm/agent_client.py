@@ -85,7 +85,21 @@ async def _mock_call(provider, payload):
     await asyncio.sleep(provider.get("simulated_latency_s", 1.5))
     time_window = payload.get("time_window")
     availability = provider.get("availability", [])
-    
+
+    service = payload.get("service", "appointment")
+    window_desc = None
+    if time_window:
+        window_desc = (
+            f"{time_window.get('date', '')} between "
+            f"{time_window.get('start', '')} and {time_window.get('end', '')}"
+        ).strip()
+    service_clean = str(service).strip() or "appointment"
+    article = "an" if service_clean[:1].lower() in {"a", "e", "i", "o", "u"} else "a"
+    request_line = f"Agent: I'd like to book {article} {service_clean}"
+    if window_desc:
+        request_line = f"{request_line} for {window_desc}"
+    request_line = f"{request_line}."
+
     # Load busy slots for conflict checking
     busy_slots = _load_busy_slots()
     
@@ -96,7 +110,10 @@ async def _mock_call(provider, payload):
             "provider": provider,
             "slot": None,
             "transcript": [
-                f"{provider['name']}: Sorry, no slots match that request."
+                f"{provider['name']}: Thank you for calling. How can we help?",
+                request_line,
+                f"{provider['name']}: Sorry, no slots match that request.",
+                "Agent: Thanks for checking. Please let us know if anything opens up.",
             ],
         }
     return {
@@ -104,8 +121,11 @@ async def _mock_call(provider, payload):
         "provider": provider,
         "slot": slot,
         "transcript": [
+            f"{provider['name']}: Thank you for calling. How can we help?",
+            request_line,
             f"{provider['name']}: We can do {slot}.",
-            "Agent: Great, please book it.",
+            "Agent: Great, please book it under Alex.",
+            f"{provider['name']}: You're all set for {slot}.",
         ],
     }
 

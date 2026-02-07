@@ -19,6 +19,14 @@ curl -X POST http://127.0.0.1:5000/swarm ^
   -d "{\"service\":\"dentist\",\"limit\":3,\"time_window\":{\"date\":\"2026-02-08\",\"start\":\"13:00\",\"end\":\"17:00\"}}"
 ```
 
+## Streaming updates
+
+```bash
+curl.exe -N -X POST http://127.0.0.1:5000/swarm/stream ^
+  -H "Content-Type: application/json" ^
+  -d "{\"service\":\"dentist\",\"limit\":3,\"time_window\":{\"date\":\"2026-02-08\",\"start\":\"13:00\",\"end\":\"17:00\"}}"
+```
+
 ## Integration hooks
 
 - Set `AGENT_MODE=mock` to use simulated providers (default).
