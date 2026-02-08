@@ -2,6 +2,8 @@ import base64
 import json
 import os
 import sys
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -10,10 +12,21 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 
 try:
-	# Optional ElevenLabs SDK (latest). If missing, we fall back to text-only.
+	# Optional ElevenLabs SDK (latest). If missing, we fall back to mock.
 	from elevenlabs.client import ElevenLabs
+	from elevenlabs.conversational_ai.conversation import (
+		Conversation,
+		ConversationInitiationData,
+	)
 except Exception:  # pragma: no cover - optional dependency
 	ElevenLabs = None
+	Conversation = None
+	ConversationInitiationData = None
+
+try:
+	import google.generativeai as genai
+except Exception:  # pragma: no cover - optional dependency
+	genai = None
 
 APP_ROOT = Path(__file__).resolve().parent
 CALENDAR_PATH = APP_ROOT / "data" / "calendar.json"
@@ -108,6 +121,152 @@ def _get_elevenlabs_client() -> Optional["ElevenLabs"]:
 	return ElevenLabs(api_key=api_key)
 
 
+def _get_gemini_model():
+	api_key = os.environ.get("GEMINI_API_KEY")
+	if not api_key or genai is None:
+		return None
+	genai.configure(api_key=api_key)
+	model_name = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+	return genai.GenerativeModel(model_name)
+
+
+def _debug_enabled() -> bool:
+	return os.environ.get("AGENT_DEBUG", "0") == "1"
+
+
+def _fallback_receptionist_reply(availability: List[str]) -> str:
+	if not availability:
+		return "Sorry, we do not have any availability. [NO_AVAILABILITY]"
+	options = ", ".join(availability[:3])
+	return f"We have availability at {options}. Do any of these work for you?"
+
+
+def _strip_markers(text: str) -> str:
+	for marker in ("[BOOKED:", "[NO_AVAILABILITY]"):
+		if marker in text:
+			text = text.split(marker, 1)[0].strip()
+	return text.strip()
+
+
+def _extract_booked_slot(text: str) -> Optional[str]:
+	if "[BOOKED:" not in text:
+		return None
+	start = text.find("[BOOKED:") + len("[BOOKED:")
+	end = text.find("]", start)
+	if end == -1:
+		return None
+	return text[start:end].strip()
+
+
+def _call_elevenlabs_agent(message: str) -> Optional[str]:
+	client = _get_elevenlabs_client()
+	agent_id = os.environ.get("ELEVENLABS_AGENT_ID")
+	if not client or not agent_id or Conversation is None or ConversationInitiationData is None:
+		if _debug_enabled():
+			print(
+				"[agent] elevenlabs unavailable",
+				{
+					"client": bool(client),
+					"agent_id": bool(agent_id),
+					"sdk": bool(Conversation and ConversationInitiationData),
+				},
+				file=sys.stderr,
+			)
+		return None
+
+	responses: List[str] = []
+	ready = threading.Event()
+
+	def _on_agent_response(response: str) -> None:
+		responses.append(str(response))
+		ready.set()
+
+	config = ConversationInitiationData(
+		conversation_config_override={"conversation": {"text_only": True}}
+	)
+
+	conversation = Conversation(
+		client,
+		agent_id,
+		requires_auth=True,
+		config=config,
+		callback_agent_response=_on_agent_response,
+	)
+
+	try:
+		if _debug_enabled():
+			print("[agent] elevenlabs send", {"agent_id": agent_id}, file=sys.stderr)
+		conversation.start_session()
+		conversation.send_user_message(message)
+	except Exception as exc:
+		print("[agent] elevenlabs error", str(exc), file=sys.stderr)
+		return None
+
+	deadline = time.monotonic() + 10
+	while time.monotonic() < deadline:
+		if ready.wait(timeout=0.2):
+			break
+
+	if responses:
+		if _debug_enabled():
+			print("[agent] elevenlabs response", responses[-1], file=sys.stderr)
+		return responses[-1]
+	return None
+
+
+def _call_gemini_receptionist(
+	provider: Dict[str, Any],
+	service: str,
+	availability: List[str],
+	busy_slots: List[tuple[datetime, datetime]],
+	time_window: Optional[Dict[str, Any]],
+	history: List[str],
+) -> Optional[str]:
+	model = _get_gemini_model()
+	if not model:
+		if _debug_enabled():
+			print("[agent] gemini unavailable", file=sys.stderr)
+		return None
+
+	busy_desc = ", ".join(
+		[f"{start.isoformat()} to {end.isoformat()}" for start, end in busy_slots]
+	)
+	availability_desc = ", ".join(availability) if availability else "none"
+	window_desc = json.dumps(time_window or {}, ensure_ascii=True)
+	conversation = "\n".join(history)
+
+	prompt = (
+		"You are a receptionist for the provider listed below. "
+		"You must only offer times in the availability list and avoid busy slots. "
+		"Respond with one short receptionist reply. "
+		"If you confirm a booking, append [BOOKED: <slot>] with the slot you booked. "
+		"If no slot is possible, append [NO_AVAILABILITY].\n\n"
+		f"Provider: {provider.get('name')}\n"
+		f"Service: {service}\n"
+		f"Availability: {availability_desc}\n"
+		f"Busy slots: {busy_desc or 'none'}\n"
+		f"Requested window: {window_desc}\n\n"
+		"Conversation so far:\n"
+		f"{conversation}\n\n"
+		"Receptionist reply:"
+	)
+
+	try:
+		if _debug_enabled():
+			print("[agent] gemini send", {"provider": provider.get("name")}, file=sys.stderr)
+		response = model.generate_content(prompt, request_options={"timeout": 10})
+		if _debug_enabled():
+			print("[agent] gemini response", str(response.text).strip(), file=sys.stderr)
+		return str(response.text).strip()
+	except Exception as exc:
+		print("[agent] gemini error", str(exc), file=sys.stderr)
+		return None
+
+
+def _collect_agent_lines(transcript: List[str]) -> List[str]:
+	return [line for line in transcript if line.startswith("Agent:")]
+
+
 def _tts_lines(lines: List[str]) -> Dict[int, str]:
 	client = _get_elevenlabs_client()
 	if not client:
@@ -161,35 +320,78 @@ def run_agent(payload: AgentRequest) -> Dict[str, Any]:
 	request_line = f"{request_line}."
 
 	busy_slots = _load_busy_slots()
+	max_turns = int(os.environ.get("RECEPTIONIST_MAX_TURNS", "6"))
+	max_seconds = int(os.environ.get("RECEPTIONIST_MAX_SECONDS", "25"))
+	start_time = time.monotonic()
+
+	transcript = [
+		f"{provider.get('name', 'Provider')}: Thank you for calling. How can we help?",
+		request_line,
+	]
+	history = [request_line]
+	booked_slot = None
+
+	for _ in range(max_turns):
+		if time.monotonic() - start_time > max_seconds:
+			print("[agent] receptionist timeout", {"provider": provider.get("name")}, file=sys.stderr)
+			break
+
+		receptionist_reply = _call_gemini_receptionist(
+			provider,
+			service_clean,
+			availability,
+			busy_slots,
+			time_window,
+			history,
+		)
+		if not receptionist_reply:
+			receptionist_reply = _fallback_receptionist_reply(availability)
+
+		booked_slot = _extract_booked_slot(receptionist_reply) or booked_slot
+		transcript.append(
+			f"{provider.get('name', 'Provider')}: {_strip_markers(receptionist_reply)}"
+		)
+		history.append(f"{provider.get('name', 'Provider')}: {_strip_markers(receptionist_reply)}")
+
+		if "[NO_AVAILABILITY]" in receptionist_reply or booked_slot:
+			break
+
+		prompt = "\n".join(history) + "\nAgent:"
+		agent_reply = _call_elevenlabs_agent(prompt)
+		if agent_reply:
+			agent_line = f"Agent: {agent_reply}"
+		else:
+			agent_line = "Agent: Could you share the earliest available slot?"
+		transcript.append(agent_line)
+		history.append(agent_line)
+
 	slot = _pick_slot(availability, time_window, busy_slots)
+	if booked_slot and booked_slot in availability:
+		slot = booked_slot
 
 	if not slot:
-		transcript = [
-			f"{provider.get('name', 'Provider')}: Thank you for calling. How can we help?",
-			request_line,
-			f"{provider.get('name', 'Provider')}: Sorry, no slots match that request.",
-			"Agent: Thanks for checking. Please let us know if anything opens up.",
-		]
+		transcript.append(
+			f"{provider.get('name', 'Provider')}: Sorry, no slots match that request."
+		)
+		transcript.append("Agent: Thanks for checking. Please let us know if anything opens up.")
 		return {
 			"status": "no_availability",
 			"provider": provider,
 			"slot": None,
 			"transcript": transcript,
-			"tts_audio_b64": _tts_lines([transcript[1], transcript[3]]),
+			"tts_audio_b64": _tts_lines(_collect_agent_lines(transcript)),
 		}
 
-	transcript = [
-		f"{provider.get('name', 'Provider')}: Thank you for calling. How can we help?",
-		request_line,
-		f"{provider.get('name', 'Provider')}: We can do {slot}.",
-		"Agent: Great, please book it under Alex.",
-		f"{provider.get('name', 'Provider')}: You're all set for {slot}.",
-	]
+
+	transcript.append(f"{provider.get('name', 'Provider')}: We can do {slot}.")
+	transcript.append("Agent: Great, please book it under Alex.")
+	transcript.append(f"{provider.get('name', 'Provider')}: You're all set for {slot}.")
+	print("[agent] completed", {"provider": provider.get("name"), "slot": slot}, file=sys.stderr)
 
 	return {
 		"status": "ok",
 		"provider": provider,
 		"slot": slot,
 		"transcript": transcript,
-		"tts_audio_b64": _tts_lines([transcript[1], transcript[3]]),
+		"tts_audio_b64": _tts_lines(_collect_agent_lines(transcript)),
 	}
