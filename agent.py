@@ -34,10 +34,7 @@ class NoOpAudioInterface(AudioInterface):
 		pass
 
 
-try:
-	import google.generativeai as genai
-except Exception:  # pragma: no cover - optional dependency
-	genai = None
+from openai import OpenAI
 
 APP_ROOT = Path(__file__).resolve().parent
 CALENDAR_PATH = APP_ROOT / "data" / "calendar.json"
@@ -132,13 +129,12 @@ def _get_elevenlabs_client() -> Optional["ElevenLabs"]:
 	return ElevenLabs(api_key=api_key)
 
 
-def _get_gemini_model():
-	api_key = os.environ.get("GEMINI_API_KEY")
-	if not api_key or genai is None:
+def _get_openai_client() -> Optional[OpenAI]:
+	api_key = os.environ.get("AZURE_OPENAI_API_KEY")
+	endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
+	if not api_key or not endpoint:
 		return None
-	genai.configure(api_key=api_key)
-	model_name = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-	return genai.GenerativeModel(model_name)
+	return OpenAI(base_url=endpoint, api_key=api_key)
 
 
 def _debug_enabled() -> bool:
@@ -169,90 +165,108 @@ def _extract_booked_slot(text: str) -> Optional[str]:
 	return text[start:end].strip()
 
 
-def _call_elevenlabs_agent(message: str) -> Optional[str]:
-	client = _get_elevenlabs_client()
-	agent_id = os.environ.get("ELEVENLABS_AGENT_ID")
-	if not client or not agent_id or Conversation is None or ConversationInitiationData is None:
-		if _debug_enabled():
-			print(
-				"[agent] elevenlabs unavailable",
-				{
-					"client": bool(client),
-					"agent_id": bool(agent_id),
-					"sdk": bool(Conversation and ConversationInitiationData),
-				},
-				file=sys.stderr,
-			)
-		return None
+class ElevenLabsSession:
+	"""A single ElevenLabs conversation session that stays open across multiple turns."""
 
-	responses: List[str] = []
-	ready = threading.Event()
-	connected = threading.Event()
+	def __init__(self):
+		self._conversation: Optional[Conversation] = None
+		self._responses: List[str] = []
+		self._ready = threading.Event()
+		self._connected = False
 
-	def _on_agent_response(response: str) -> None:
-		responses.append(str(response))
-		ready.set()
+	def start(self) -> bool:
+		"""Open the session. Returns True if connected successfully."""
+		client = _get_elevenlabs_client()
+		agent_id = os.environ.get("ELEVENLABS_AGENT_ID")
+		if not client or not agent_id:
+			if _debug_enabled():
+				print("[agent] elevenlabs unavailable", file=sys.stderr)
+			return False
 
-	def _on_user_transcript(transcript: str) -> None:
-		# Fires when the server echoes back the user message, meaning ws is live.
-		connected.set()
+		def _on_agent_response(response: str) -> None:
+			self._responses.append(str(response))
+			self._ready.set()
 
-	config = ConversationInitiationData(
-		conversation_config_override={"conversation": {"text_only": True}}
-	)
+		config = ConversationInitiationData(
+			conversation_config_override={"conversation": {"text_only": True}}
+		)
 
-	conversation = Conversation(
-		client,
-		agent_id,
-		requires_auth=True,
-		config=config,
-		audio_interface=NoOpAudioInterface(),
-		callback_agent_response=_on_agent_response,
-		callback_user_transcript=_on_user_transcript,
-	)
+		self._conversation = Conversation(
+			client,
+			agent_id,
+			requires_auth=True,
+			config=config,
+			audio_interface=NoOpAudioInterface(),
+			callback_agent_response=_on_agent_response,
+		)
 
-	try:
-		if _debug_enabled():
-			print("[agent] elevenlabs send", {"agent_id": agent_id}, file=sys.stderr)
-		conversation.start_session()
+		try:
+			if _debug_enabled():
+				print("[agent] elevenlabs session start", {"agent_id": agent_id}, file=sys.stderr)
+			self._conversation.start_session()
 
-		# Wait for the WebSocket connection to be established in the background thread.
-		for _ in range(20):
-			if conversation._ws is not None:
-				break
-			time.sleep(0.25)
+			# Wait for the WebSocket connection to be established.
+			for _ in range(20):
+				if self._conversation._ws is not None:
+					break
+				time.sleep(0.25)
 
-		if conversation._ws is None:
-			print("[agent] elevenlabs error: websocket did not connect in time", file=sys.stderr)
-			conversation.end_session()
+			if self._conversation._ws is None:
+				print("[agent] elevenlabs error: websocket did not connect in time", file=sys.stderr)
+				self._conversation.end_session()
+				self._conversation = None
+				return False
+
+			self._connected = True
+			return True
+		except Exception as exc:
+			print("[agent] elevenlabs error", str(exc), file=sys.stderr)
+			self.close()
+			return False
+
+	def send(self, message: str) -> Optional[str]:
+		"""Send a message within the existing session and wait for the response."""
+		if not self._connected or not self._conversation or not self._conversation._ws:
 			return None
 
-		conversation.send_user_message(message)
-	except Exception as exc:
-		print("[agent] elevenlabs error", str(exc), file=sys.stderr)
+		self._ready.clear()
+		count_before = len(self._responses)
+
 		try:
-			conversation.end_session()
-		except Exception:
-			pass
+			if _debug_enabled():
+				print("[agent] elevenlabs send", repr(message[:80]), file=sys.stderr)
+			self._conversation.send_user_message(message)
+		except Exception as exc:
+			print("[agent] elevenlabs send error", str(exc), file=sys.stderr)
+			return None
+
+		deadline = time.monotonic() + 10
+		while time.monotonic() < deadline:
+			if self._ready.wait(timeout=0.2):
+				# Check that we actually got a new response (not a stale signal).
+				if len(self._responses) > count_before:
+					break
+				self._ready.clear()
+
+		if len(self._responses) > count_before:
+			result = self._responses[-1]
+			if _debug_enabled():
+				print("[agent] elevenlabs response", result, file=sys.stderr)
+			return result
 		return None
 
-	deadline = time.monotonic() + 10
-	while time.monotonic() < deadline:
-		if ready.wait(timeout=0.2):
-			break
-
-	result = responses[-1] if responses else None
-	try:
-		conversation.end_session()
-	except Exception:
-		pass
-
-	if result and _debug_enabled():
-		print("[agent] elevenlabs response", result, file=sys.stderr)
-	return result
+	def close(self):
+		"""End the session and clean up."""
+		if self._conversation:
+			try:
+				self._conversation.end_session()
+			except Exception:
+				pass
+			self._conversation = None
+		self._connected = False
 
 
-def _call_gemini_receptionist(
+def _call_openai_receptionist(
 	provider: Dict[str, Any],
 	service: str,
 	availability: List[str],
@@ -260,10 +274,10 @@ def _call_gemini_receptionist(
 	time_window: Optional[Dict[str, Any]],
 	history: List[str],
 ) -> Optional[str]:
-	model = _get_gemini_model()
-	if not model:
+	client = _get_openai_client()
+	if not client:
 		if _debug_enabled():
-			print("[agent] gemini unavailable", file=sys.stderr)
+			print("[agent] openai unavailable", file=sys.stderr)
 		return None
 
 	busy_desc = ", ".join(
@@ -271,34 +285,50 @@ def _call_gemini_receptionist(
 	)
 	availability_desc = ", ".join(availability) if availability else "none"
 	window_desc = json.dumps(time_window or {}, ensure_ascii=True)
-	conversation = "\n".join(history)
 
-	prompt = (
-		"You are a receptionist for the provider listed below. "
+	system_prompt = (
+		f"You are a highly reliable and friendly receptionist for the provider listed below. " 
+		f"Always begin every new conversation with a welcoming message such as: "
+		f"'Hello, this is {provider.get('name')}, how can I help you today?' "
+		"After greeting, handle the user's requests. "
 		"You must only offer times in the availability list and avoid busy slots. "
-		"Respond with one short receptionist reply. "
-		"If user didn't specify end time, assume they want to book for the one hour slot after the start time."
+		"Respond with one short, clear receptionist reply at a time. "
+		"If the user didn't specify an end time, assume they want to book for the one hour slot after the start time. "
 		"If you confirm a booking, append [BOOKED: <slot>] with the slot you booked. "
-		"If no slot is possible, append [NO_AVAILABILITY].\n\n"
+		"If no slot is possible, append [NO_AVAILABILITY]. "
+		"Be concise, professional, and never hallucinate availability or booking details.\n\n"
 		f"Provider: {provider.get('name')}\n"
 		f"Service: {service}\n"
 		f"Availability: {availability_desc}\n"
 		f"Busy slots: {busy_desc or 'none'}\n"
-		f"Requested window: {window_desc}\n\n"
-		"Conversation so far:\n"
-		f"{conversation}\n\n"
-		"Receptionist reply:"
+		f"Requested window: {window_desc}"
 	)
+
+	messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
+	for line in history:
+		if line.startswith("Agent:"):
+			messages.append({"role": "user", "content": line[len("Agent:"):].strip()})
+		else:
+			messages.append({"role": "assistant", "content": line.split(":", 1)[-1].strip()})
+
+	model_name = os.environ.get("AZURE_OPENAI_MODEL", "gpt-4o")
 
 	try:
 		if _debug_enabled():
-			print("[agent] gemini send", {"provider": provider.get("name")}, file=sys.stderr)
-		response = model.generate_content(prompt, request_options={"timeout": 10})
+			print("[agent] openai send", {"provider": provider.get("name")}, file=sys.stderr)
+		response = client.chat.completions.create(
+			model=model_name,
+			messages=messages,
+			temperature=0.7,
+			max_tokens=256,
+			timeout=10,
+		)
+		reply = response.choices[0].message.content.strip()
 		if _debug_enabled():
-			print("[agent] gemini response", str(response.text).strip(), file=sys.stderr)
-		return str(response.text).strip()
+			print("[agent] openai response", reply, file=sys.stderr)
+		return reply
 	except Exception as exc:
-		print("[agent] gemini error", str(exc), file=sys.stderr)
+		print("[agent] openai error", str(exc), file=sys.stderr)
 		return None
 
 
@@ -374,12 +404,18 @@ def run_agent(payload: AgentRequest) -> Dict[str, Any]:
 	history = [request_line]
 	booked_slot = None
 
+	# Open ONE ElevenLabs session for the entire provider conversation.
+	# The ElevenLabs agent's system prompt is configured on the dashboard.
+	# Receptionist speaks first, then the agent responds.
+	el_session = ElevenLabsSession()
+	el_active = el_session.start()
+
 	for _ in range(max_turns):
 		if time.monotonic() - start_time > max_seconds:
 			print("[agent] receptionist timeout", {"provider": provider.get("name")}, file=sys.stderr)
 			break
 
-		receptionist_reply = _call_gemini_receptionist(
+		receptionist_reply = _call_openai_receptionist(
 			provider,
 			service_clean,
 			availability,
@@ -398,8 +434,8 @@ def run_agent(payload: AgentRequest) -> Dict[str, Any]:
 
 		conversation_done = "[NO_AVAILABILITY]" in receptionist_reply or bool(booked_slot)
 
-		# Send only the receptionist's latest reply to the ElevenLabs agent.
-		agent_reply = _call_elevenlabs_agent(_strip_markers(receptionist_reply))
+		# Send the receptionist's latest reply within the same ElevenLabs session.
+		agent_reply = el_session.send(_strip_markers(receptionist_reply)) if el_active else None
 		if agent_reply:
 			agent_line = f"Agent: {agent_reply}"
 		elif conversation_done and booked_slot:
@@ -413,6 +449,8 @@ def run_agent(payload: AgentRequest) -> Dict[str, Any]:
 
 		if conversation_done:
 			break
+
+	el_session.close()
 
 	slot = _pick_slot(availability, time_window, busy_slots)
 	if booked_slot and booked_slot in availability:
