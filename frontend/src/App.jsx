@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import LandingPage from './components/LandingPage';
 import ServiceSelection from './components/ServiceSelection';
 import TimeWindowSelector from './components/TimeWindowSelector';
@@ -39,18 +39,23 @@ function App() {
   const [busySlots, setBusySlots] = useState([]);
   const [selectedAppointment, setSelectedAppointment] = useState(null);
 
-  // Load busy slots from calendar
+  // Load busy slots from calendar (graceful if backend returns 500 or is down)
   useEffect(() => {
     const loadBusySlots = async () => {
       try {
         const response = await fetch('/data/calendar.json');
+        let data = {};
         if (response.ok) {
-          const data = await response.json();
-          setBusySlots(data.user_calendar?.busy_slots || []);
+          try {
+            data = await response.json();
+          } catch {
+            // non-JSON response
+          }
         }
+        setBusySlots(data.user_calendar?.busy_slots || []);
       } catch (e) {
         console.warn('Could not load calendar data:', e);
-        // Continue without calendar data - not critical
+        setBusySlots([]);
       }
     };
     loadBusySlots();
@@ -65,13 +70,13 @@ function App() {
     setFormData((prev) => ({ ...prev, service }));
   };
 
-  const handleTimeWindowChange = (timeWindow) => {
+  const handleTimeWindowChange = useCallback((timeWindow) => {
     setFormData((prev) => ({ ...prev, time_window: timeWindow }));
-  };
+  }, []);
 
-  const handlePreferencesChange = (preferences) => {
+  const handlePreferencesChange = useCallback((preferences) => {
     setFormData((prev) => ({ ...prev, preferences }));
-  };
+  }, []);
 
   const handleStartSwarm = async () => {
     setError(null);
@@ -116,13 +121,14 @@ function App() {
         },
         onComplete: (event) => {
           setIsSwarmActive(false);
+          if (event.error) setError(event.error);
           setRankedResults(event.ranked || []);
           setBestResult(event.best || null);
           setCurrentView(VIEWS.RESULTS);
         },
         onError: (err) => {
           setIsSwarmActive(false);
-          setError(err.error || 'An error occurred during the swarm call. Please try again.');
+          setError(err?.message || 'An error occurred during the swarm call. Please try again.');
           console.error('Swarm error:', err);
           // Show results even if there were errors, if we have any
           if (swarmResults.length > 0) {
@@ -132,7 +138,7 @@ function App() {
       });
     } catch (err) {
       setIsSwarmActive(false);
-      setError(err.error || 'Failed to start swarm. Please check your connection and try again.');
+      setError(err?.message || 'Failed to start swarm. Please check your connection and try again.');
       console.error('Swarm error:', err);
       setCurrentView(VIEWS.INPUT);
     }

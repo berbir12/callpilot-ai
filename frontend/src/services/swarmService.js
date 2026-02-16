@@ -16,7 +16,16 @@ export const startSwarm = async (payload, callbacks) => {
     });
 
     if (!response.ok) {
-      throw new Error(`HTTP error! status: ${response.status}`);
+      let message = `Request failed (${response.status})`;
+      try {
+        const body = await response.json();
+        if (body && typeof body.error === 'string') message = body.error;
+      } catch {
+        // ignore
+      }
+      const err = new Error(message);
+      err.status = response.status;
+      throw err;
     }
 
     const reader = response.body.getReader();

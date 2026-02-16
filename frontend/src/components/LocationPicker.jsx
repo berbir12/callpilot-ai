@@ -4,6 +4,9 @@ import 'mapbox-gl/dist/mapbox-gl.css';
 import './LocationPicker.css';
 
 const MAPBOX_TOKEN = import.meta.env.VITE_MAPBOX_TOKEN;
+// Mapbox GL in the browser requires a *public* token (pk.*). Secret tokens (sk.*) must not be used in frontend code.
+const MAPBOX_TOKEN_IS_PUBLIC =
+  typeof MAPBOX_TOKEN === 'string' && MAPBOX_TOKEN.trim().startsWith('pk.');
 
 const LocationPicker = ({ value, onChange }) => {
   const mapContainer = useRef(null);
@@ -14,7 +17,7 @@ const LocationPicker = ({ value, onChange }) => {
 
   // Reverse geocode to get a readable address
   const reverseGeocode = useCallback(async (lng, lat) => {
-    if (!MAPBOX_TOKEN) return;
+    if (!MAPBOX_TOKEN_IS_PUBLIC) return;
     try {
       const res = await fetch(
         `https://api.mapbox.com/geocoding/v5/mapbox.places/${lng},${lat}.json?access_token=${MAPBOX_TOKEN}&limit=1`
@@ -27,9 +30,15 @@ const LocationPicker = ({ value, onChange }) => {
     }
   }, []);
 
-  // Place or move the marker
+  // Place or move the marker (skip redundant onChange to avoid update loops)
   const setMarker = useCallback((lng, lat) => {
     if (!map.current) return;
+    const newCoords = { lat, lng };
+    const same =
+      value &&
+      Math.abs(value.lat - lat) < 1e-6 &&
+      Math.abs(value.lng - lng) < 1e-6;
+    if (!same) onChange(newCoords);
 
     if (marker.current) {
       marker.current.setLngLat([lng, lat]);
@@ -45,13 +54,12 @@ const LocationPicker = ({ value, onChange }) => {
       });
     }
 
-    onChange({ lat, lng });
     reverseGeocode(lng, lat);
-  }, [onChange, reverseGeocode]);
+  }, [onChange, reverseGeocode, value]);
 
-  // Initialize map
+  // Initialize map (only with a public pk.* token)
   useEffect(() => {
-    if (!MAPBOX_TOKEN || map.current) return;
+    if (!MAPBOX_TOKEN_IS_PUBLIC || map.current) return;
 
     mapboxgl.accessToken = MAPBOX_TOKEN;
 
@@ -118,6 +126,22 @@ const LocationPicker = ({ value, onChange }) => {
         <label className="input-label">Your Location</label>
         <div className="location-missing-token">
           Set <code>VITE_MAPBOX_TOKEN</code> in your <code>.env</code> to enable the map.
+        </div>
+      </div>
+    );
+  }
+
+  if (!MAPBOX_TOKEN_IS_PUBLIC) {
+    return (
+      <div className="location-picker">
+        <label className="input-label">Your Location</label>
+        <div className="location-missing-token">
+          Use a <strong>public</strong> Mapbox token (<code>pk.*</code>), not a secret token (<code>sk.*</code>).
+          Get a public token at{' '}
+          <a href="https://account.mapbox.com/access-tokens/" target="_blank" rel="noopener noreferrer">
+            account.mapbox.com
+          </a>
+          .
         </div>
       </div>
     );

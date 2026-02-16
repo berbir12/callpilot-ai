@@ -121,14 +121,32 @@ def stream_swarm_sync(payload, providers, max_concurrency=5, timeout_s=25):
     updates = queue.Queue()
 
     async def producer():
-        async for event in run_swarm_stream(
-            payload, providers, max_concurrency, timeout_s
-        ):
-            updates.put(event)
-        updates.put(None)
+        try:
+            async for event in run_swarm_stream(
+                payload, providers, max_concurrency, timeout_s
+            ):
+                updates.put(event)
+        except Exception as e:
+            updates.put({
+                "type": "complete",
+                "error": str(e),
+                "ranked": [],
+                "best": None,
+            })
+        finally:
+            updates.put(None)
 
     def runner():
-        asyncio.run(producer())
+        try:
+            asyncio.run(producer())
+        except Exception as e:
+            updates.put({
+                "type": "complete",
+                "error": str(e),
+                "ranked": [],
+                "best": None,
+            })
+            updates.put(None)
 
     threading.Thread(target=runner, daemon=True).start()
 

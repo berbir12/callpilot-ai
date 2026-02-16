@@ -16,16 +16,31 @@ app = Flask(__name__, static_folder='data')
 CORS(app)  # Enable CORS for all routes
 
 
+@app.errorhandler(500)
+def handle_500(e):
+    """Ensure 500 responses are JSON and log the real error."""
+    import traceback
+    traceback.print_exc()
+    return jsonify({"error": "Internal server error", "detail": str(e)}), 500
+
+
 def load_providers():
-    with open(PROVIDERS_PATH, "r", encoding="utf-8") as handle:
-        data = json.load(handle)
-    return data.get("providers", [])
+    try:
+        with open(PROVIDERS_PATH, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data.get("providers", [])
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        print(f"[load_providers] {e}")
+        return []
 
 
 def filter_providers(providers, service, limit):
     filtered = providers
     if service:
         filtered = [p for p in providers if p.get("service") == service]
+        # If no providers match the requested service, use all (demo fallback)
+        if not filtered and providers:
+            filtered = providers
     if limit:
         filtered = filtered[:limit]
     return filtered
@@ -97,14 +112,15 @@ def index():
 
 @app.get("/data/calendar.json")
 def get_calendar():
-    """Serve calendar data for frontend"""
-    calendar_path = APP_ROOT / "data" / "calendar.json"
+    """Serve calendar data for frontend. Never 500 - always return valid JSON."""
     try:
+        calendar_path = APP_ROOT / "data" / "calendar.json"
         with open(calendar_path, "r", encoding="utf-8") as handle:
             data = json.load(handle)
         return jsonify(data)
-    except FileNotFoundError:
-        return jsonify({"user_calendar": {"busy_slots": []}}), 404
+    except Exception as e:
+        print(f"[calendar] Error: {e}")
+    return jsonify({"user_calendar": {"busy_slots": []}})
 
 
 @app.post("/swarm")
@@ -143,7 +159,11 @@ def swarm():
 
 @app.post("/swarm/stream")
 def swarm_stream():
-    payload = request.get_json(silent=True) or {}
+    try:
+        payload = request.get_json(silent=True) or {}
+    except Exception as e:
+        return jsonify({"error": f"Invalid JSON: {e}"}), 400
+
     service = payload.get("service")
     limit = payload.get("limit", 5)
     lat = payload.get("lat")
@@ -154,30 +174,42 @@ def swarm_stream():
     time_window = payload.get("time_window") or {}
     date = time_window.get("date")
 
-    # If lat/lng provided, fetch real providers from Google Places
-    if lat is not None and lng is not None:
-        try:
-            radius = payload.get("radius", 5000)
-            if service:
-                providers = search_nearby(service, lat, lng, radius, limit, date=date)
-            else:
-                providers = search_all_services(lat, lng, radius, limit, date=date)
-            # Save to providers.json so the rest of the pipeline can reference them
-            save_providers(providers, merge=False)
-            print(f"[places] Found {len(providers)} providers via Google Places")
-        except Exception as e:
-            print(f"[places] Error: {e}, falling back to providers.json")
+    try:
+        # If lat/lng provided, fetch real providers from Google Places
+        if lat is not None and lng is not None:
+            try:
+                radius = payload.get("radius", 5000)
+                if service:
+                    providers = search_nearby(service, lat, lng, radius, limit, date=date)
+                else:
+                    providers = search_all_services(lat, lng, radius, limit, date=date)
+                # Save to providers.json so the rest of the pipeline can reference them
+                save_providers(providers, merge=False)
+                print(f"[places] Found {len(providers)} providers via Google Places")
+            except Exception as e:
+                print(f"[places] Error: {e}, falling back to providers.json")
+                providers = filter_providers(load_providers(), service, limit)
+        else:
             providers = filter_providers(load_providers(), service, limit)
-    else:
-        providers = filter_providers(load_providers(), service, limit)
+    except Exception as e:
+        print(f"[swarm/stream] Error loading providers: {e}")
+        return jsonify({"error": f"Failed to load providers: {e}"}), 500
 
     if not providers:
         return jsonify({"error": "no providers available"}), 400
 
     def event_stream():
-        # Output NDJSON format for frontend compatibility
-        for event in stream_swarm_sync(payload, providers):
-            yield json.dumps(event) + "\n"
+        try:
+            for event in stream_swarm_sync(payload, providers):
+                yield json.dumps(event) + "\n"
+        except Exception as e:
+            print(f"[swarm/stream] Error: {e}")
+            yield json.dumps({
+                "type": "complete",
+                "error": str(e),
+                "ranked": [],
+                "best": None,
+            }) + "\n"
 
     return Response(stream_with_context(event_stream()), mimetype="application/x-ndjson")
 
